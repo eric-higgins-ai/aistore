@@ -639,11 +639,48 @@ func (reb *Reb) retransmit(rargs *rargs) (cnt int64) {
 		loghdr = rargs.logHdr
 	)
 	for _, lomAck := range reb.lomAcks() {
+		// Snapshot pending entries under the lock, then process without holding it.
+		// Per-item work below does disk I/O (lom.Load, getROC) and network I/O
+		// (HeadObjT2T, doSend); holding lomAck.mu across those ops starves
+		// wackStatus served by /v1/health?rbs=true (same mu) and blocks concurrent
+		// ACK processing via ackLomAck. Under load that starvation can exceed
+		// `client_timeout` and trigger false-positive rebalance aborts.
 		lomAck.mu.Lock()
+		n := len(lomAck.q)
+		if n == 0 {
+			lomAck.mu.Unlock()
+			continue
+		}
+		unames := make([]string, 0, n)
+		lifs := make([]core.LIF, 0, n)
 		for uname, lif := range lomAck.q {
+			unames = append(unames, uname)
+			lifs = append(lifs, lif)
+		}
+		lomAck.mu.Unlock()
+
+		isPending := func(uname string, lif core.LIF) bool {
+			lomAck.mu.Lock()
+			cur, ok := lomAck.q[uname]
+			lomAck.mu.Unlock()
+			return ok && cur == lif
+		}
+		deleteIfPending := func(uname string, lif core.LIF) {
+			lomAck.mu.Lock()
+			if cur, ok := lomAck.q[uname]; ok && cur == lif {
+				delete(lomAck.q, uname)
+			}
+			lomAck.mu.Unlock()
+		}
+
+		for i, lif := range lifs {
+			uname := unames[i]
+			if !isPending(uname, lif) {
+				continue
+			}
 			lom, err := lif.LOM()
 			if err != nil {
-				delete(lomAck.q, uname)
+				deleteIfPending(uname, lif)
 				if cmn.Rom.V(4, cos.ModReb) {
 					nlog.Warningln(err)
 				}
@@ -658,7 +695,7 @@ func (reb *Reb) retransmit(rargs *rargs) (cnt int64) {
 					err = cmn.NewErrFailedTo(core.T, "load", lom.Cname(), err)
 					xreb.AddErr(err)
 				}
-				delete(lomAck.q, uname)
+				deleteIfPending(uname, lif)
 				core.FreeLOM(lom)
 				continue
 			}
@@ -667,7 +704,7 @@ func (reb *Reb) retransmit(rargs *rargs) (cnt int64) {
 				if cmn.Rom.V(4, cos.ModReb) {
 					nlog.Infof("%s: HEAD ok %s at %s", loghdr, lom, tsi.StringEx())
 				}
-				delete(lomAck.q, uname)
+				deleteIfPending(uname, lif)
 				core.FreeLOM(lom)
 				continue
 			}
@@ -692,12 +729,10 @@ func (reb *Reb) retransmit(rargs *rargs) (cnt int64) {
 			}
 
 			if xreb.IsAborted() {
-				lomAck.mu.Unlock()
 				return 0
 			}
 		}
 
-		lomAck.mu.Unlock()
 		if xreb.IsAborted() {
 			return 0
 		}
